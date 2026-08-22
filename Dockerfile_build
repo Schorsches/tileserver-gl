@@ -33,7 +33,11 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
     apt-get -qq update && \
     apt-get install -y --no-install-recommends --no-install-suggests nodejs && \
-    npm i -g npm@latest && \
+    # Deliberately NOT `npm i -g npm@latest`: npm 12 blocks package install
+    # scripts by default (allowScripts), which silently skips the native builds
+    # for canvas, sqlite3 and @maplibre/maplibre-gl-native and produces an image
+    # that builds fine and then crashes on startup with "Could not locate the
+    # bindings file". Use the npm bundled with the pinned Node instead.
     # Cleanup to keep the image size down
     apt-get -y remove curl gnupg && \
     apt-get -y --purge autoremove && \

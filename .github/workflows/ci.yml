@@ -57,3 +57,18 @@ jobs:
         with:
           dockerfile: Dockerfile
           ignore: DL3008,DL3015
+
+      # DL3018 asks for pinned apk versions. Alpine point releases retire exact
+      # versions from the index, so pinning them breaks the build within weeks;
+      # the base image is pinned by tag instead.
+      - name: Run hadolint on the Alpine Dockerfiles 🐳
+        uses: hadolint/hadolint-action@v3.3.0
+        with:
+          dockerfile: Dockerfile.alpine
+          ignore: DL3008,DL3015,DL3018
+
+      - name: Run hadolint on the mbgl prebuild Dockerfile 🐳
+        uses: hadolint/hadolint-action@v3.3.0
+        with:
+          dockerfile: Dockerfile.mbgl
+          ignore: DL3008,DL3015,DL3018

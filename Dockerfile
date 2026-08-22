@@ -29,7 +29,11 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends --no-install-suggests nodejs && \
-    npm i -g npm@latest && \
+    # Deliberately NOT `npm i -g npm@latest`: npm 12 blocks package install
+    # scripts by default (allowScripts), which silently skips the native builds
+    # for canvas, sqlite3 and @maplibre/maplibre-gl-native and produces an image
+    # that builds fine and then crashes on startup with "Could not locate the
+    # bindings file". Use the npm bundled with the pinned Node instead.
     apt-get -y remove curl gnupg && \
     apt-get -y --purge autoremove && \
     apt-get clean && \
@@ -46,7 +50,10 @@ RUN npm config set fetch-retries 5 && \
     npm config set fetch-retry-maxtimeout 600000 && \
     npm ci --omit=dev && \
     # Build canvas from source for the Noble architecture
-    npm rebuild canvas --build-from-source && \
+    # `--build-from-source` was never a real npm flag -- npm just forwarded it as
+    # npm_config_build_from_source and npm 12 made unknown flags fatal. Set the
+    # env var directly: same mechanism, portable across npm versions.
+    npm_config_build_from_source=true npm rebuild canvas && \
     chown -R root:root /usr/src/app
 
 # --- Final Stage ---
@@ -80,7 +87,6 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends --no-install-suggests nodejs && \
-    npm i -g npm@latest && \
     # Create appropriate symlinks if needed
     ln -sf "$(find /usr -name "libjemalloc.so*" | head -n 1)" /usr/lib/libjemalloc.so && \
     apt-get -y remove curl gnupg && \
@@ -100,6 +106,14 @@ ENV \
 
 COPY --from=builder /usr/src/app /usr/src/app
 COPY . /usr/src/app
+
+# The image built cleanly while every native module was missing, because npm 12
+# silently skips install scripts. Fail the build instead of the container.
+RUN node -e "require('/usr/src/app/node_modules/@maplibre/maplibre-gl-native'); \
+             require('/usr/src/app/node_modules/canvas'); \
+             require('/usr/src/app/node_modules/sharp'); \
+             require('/usr/src/app/node_modules/sqlite3'); \
+             console.log('native modules load OK')"
 
 RUN mkdir -p /data && chown node:node /data
 VOLUME /data

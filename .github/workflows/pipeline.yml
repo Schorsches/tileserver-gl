@@ -32,11 +32,17 @@ jobs:
     needs:
       - extract-branch
     uses: ./.github/workflows/ct.yml
+  ct-alpine:
+    name: 'CT Alpine'
+    needs:
+      - extract-branch
+    uses: ./.github/workflows/ct-alpine.yml
   automerger:
     name: 'Automerge Dependabot PRs'
     needs:
       - ci
       - ct
+      - ct-alpine
       - extract-branch
     if: >
       github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'

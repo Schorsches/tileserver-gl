@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1
+#
+# Builds the two musl artifacts the Alpine tileserver-gl image needs:
+#
+#   /mbgl.node             MapLibre Native's Node addon, compiled against musl
+#                          with the surfaceless EGL backend (no X11, no Xvfb)
+#   /libmusl-bigstack.so   an LD_PRELOAD stub that raises musl's 128 KiB default
+#                          thread stack to 8 MiB, matching glibc
+#
+# Upstream publishes exactly one Linux prebuilt binary for
+# @maplibre/maplibre-gl-native. It is glibc-linked, soname-pinned to Ubuntu
+# 24.04's ICU 74, and renders through GLX/X11, so it cannot run on Alpine --
+# hence this build. See docker/build-mbgl-alpine.sh for the details.
+#
+# The compile takes 30-60 minutes, so this is built once per
+# (maplibre version x node ABI x arch) by .github/workflows/mbgl-prebuild.yml
+# and published to GHCR. Dockerfile.alpine then just COPYs from it.
+#
+#   docker build -f Dockerfile.mbgl -t tileserver-gl-mbgl:6.4.1-abi137 .
+
+ARG NODE_IMAGE=node:24-alpine3.22
+
+FROM ${NODE_IMAGE} AS build
+
+ARG MAPLIBRE_REF=node-v6.4.1
+ARG BUILTIN_ICU=ON
+
+COPY docker/build-mbgl-alpine.sh docker/musl-bigstack.c /usr/src/docker/
+
+RUN MAPLIBRE_REF="${MAPLIBRE_REF}" \
+    BUILTIN_ICU="${BUILTIN_ICU}" \
+    STUB_SRC=/usr/src/docker/musl-bigstack.c \
+    OUT_DIR=/out \
+    sh /usr/src/docker/build-mbgl-alpine.sh
+
+# Ship the artifacts alone, with no base image behind them. Consumed via
+# COPY --from=, so a multi-arch manifest list resolves per TARGETPLATFORM and
+# the app Dockerfile needs no architecture conditionals.
+FROM scratch
+COPY --from=build /out/ /

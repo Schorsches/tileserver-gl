@@ -1,0 +1,184 @@
+# syntax=docker/dockerfile:1
+#
+# Alpine build of tileserver-gl, functionally equivalent to the Ubuntu image in
+# ./Dockerfile but with a far smaller attack surface.
+#
+# Two differences do the heavy lifting:
+#   * MapLibre Native is compiled against musl with its surfaceless EGL backend,
+#     so the entire X11 stack and the Xvfb entrypoint dance disappear.
+#   * ICU is vendored into that binary, so icu-libs is gone too.
+#
+# The addon is expensive to build, so it comes from a prebuilt image published
+# by .github/workflows/mbgl-prebuild.yml. To build it inline instead:
+#   docker build -f Dockerfile.mbgl -t tileserver-gl-mbgl:local .
+#   docker build -f Dockerfile.alpine --build-arg MBGL_IMAGE=tileserver-gl-mbgl:local -t tileserver-gl:alpine .
+
+ARG NODE_IMAGE=node:24-alpine3.22
+ARG MBGL_IMAGE=ghcr.io/schorsches/tileserver-gl-mbgl:node-v6.4.1-abi137-alpine3.22-egl
+
+FROM ${MBGL_IMAGE} AS mbgl
+
+# --- Dependencies -----------------------------------------------------------
+FROM ${NODE_IMAGE} AS builder
+
+ARG NODE_ABI=137
+ENV NODE_ENV="production"
+
+# canvas and sqlite3 publish no musl prebuilds, so both are compiled here.
+# sharp does ship musl binaries (@img/sharp-linuxmusl-*) and needs nothing.
+# py3-setuptools is the Alpine equivalent of the Ubuntu image's
+# python3-setuptools: Python 3.12 dropped distutils, which the bundled node-gyp
+# still imports, and setuptools ships the shim that puts it back.
+RUN apk add --no-cache \
+      build-base python3 py3-setuptools pkgconf \
+      cairo-dev pango-dev libjpeg-turbo-dev giflib-dev librsvg-dev pixman-dev \
+      sqlite-dev
+
+WORKDIR /usr/src/app
+
+COPY package.json package-lock.json ./
+
+# --ignore-scripts is required, not cosmetic: @maplibre/maplibre-gl-native's
+# install script is `node-pre-gyp install --fallback-to-build=false`, which
+# would fetch the glibc tarball and fail. The npm tarball ships no binding.gyp,
+# so building from source in place is not an option either -- the addon is
+# built out-of-tree and dropped in below.
+#
+# Because --ignore-scripts is global, everything that legitimately needs a
+# lifecycle script has to be re-run explicitly: canvas and sqlite3 native
+# builds, and `prepare`, which populates public/resources/ and without which
+# the image starts but serves no client assets.
+RUN npm config set fetch-retries 5 && \
+    npm config set fetch-retry-mintimeout 100000 && \
+    npm config set fetch-retry-maxtimeout 600000 && \
+    npm ci --omit=dev --ignore-scripts && \
+    # The env-var form rather than `--build-from-source`: npm 12 rejects that
+    # CLI flag outright (EUNKNOWNCONFIG), while npm_config_build_from_source is
+    # read by node-gyp/prebuild-install and works across npm versions.
+    npm_config_build_from_source=true npm rebuild canvas && \
+    npm rebuild sqlite3 && \
+    npm run prepare
+
+COPY --from=mbgl /mbgl.node \
+     /usr/src/app/node_modules/@maplibre/maplibre-gl-native/lib/node-v${NODE_ABI}/mbgl.node
+
+# The addon is built for one specific Node ABI and installed at a path that
+# encodes it, so a drifting base image would silently ship a binary that can
+# never load. Catch that here; the dlopen check belongs in the final stage,
+# where the runtime libraries actually exist.
+RUN test "$(node -p 'process.versions.modules')" = "${NODE_ABI}" && \
+    test -f "node_modules/@maplibre/maplibre-gl-native/lib/node-v${NODE_ABI}/mbgl.node" && \
+    chown -R root:root /usr/src/app
+
+# Drop install-time-only tooling (node-pre-gyp and its octokit tree,
+# npm-run-all, copyfiles) that the running server never imports but that
+# scanners keep reporting. Computed from package-lock.json rather than
+# hardcoded, so it stays correct as dependencies move.
+COPY docker/prune-runtime-modules.mjs /usr/local/bin/
+RUN node /usr/local/bin/prune-runtime-modules.mjs /usr/src/app
+
+# --- Runtime ----------------------------------------------------------------
+FROM ${NODE_IMAGE} AS final
+
+ARG NODE_ABI=137
+
+# The published Ubuntu image runs as node:node with uid/gid 999, while the
+# official node:alpine image ships uid/gid 1000. Renumbering keeps bind-mounted
+# /data permissions working for anyone upgrading from the Ubuntu image -- a
+# silent uid change would leave existing /data mounts unwritable.
+#
+# gid 999 is held by Alpine's `ping` group, which exists for iputils' setuid
+# helper; this image has only busybox ping, which does not use it. Move it aside
+# rather than delete it, so /etc/group stays internally consistent.
+RUN sed -i 's/^ping:x:999:/ping:x:998:/' /etc/group && \
+    deluser node && \
+    (delgroup node 2>/dev/null || true) && \
+    addgroup -g 999 node && \
+    adduser -D -u 999 -G node -h /home/node -s /bin/sh node && \
+    apk add --no-cache \
+      # surfaceless EGL rendering on the llvmpipe software rasteriser
+      mesa-egl mesa-gles mesa-dri-gallium \
+      # mbgl.node's remaining shared libraries (no icu-libs: ICU is vendored)
+      libcurl libpng libwebp libuv libjpeg-turbo zlib \
+      # canvas: cairo/pango/rsvg, plus the DejaVu fonts the Ubuntu image gets
+      # transitively and which src/render.js needs for '10px sans-serif'
+      # watermark and attribution text
+      cairo pango librsvg giflib pixman fontconfig freetype font-dejavu \
+      jemalloc tini ca-certificates && \
+    apk upgrade --no-cache && \
+    mkdir -p /home/node/.aws && \
+    chown -R node:node /home/node && \
+    # mesa-dri-gallium ships one pipe driver per GPU family (iris, radeonsi,
+    # nouveau, ...). This container renders in software through llvmpipe and has
+    # no GPU access at all, so only pipe_swrast is reachable and the rest is
+    # ~89 MB of dead weight.
+    find /usr/lib/gallium-pipe -name 'pipe_*.so' ! -name 'pipe_swrast.so' -delete && \
+    # The runtime never shells out to a package manager -- the entrypoint runs
+    # `node` directly -- but the npm CLI bundles its own vendored dependency
+    # tree (tar, undici, brace-expansion, sigstore, ...) which scanners report
+    # against this image and which nothing here can patch. Dockerfile_test
+    # .alpine copies npm back in for the test run.
+    #
+    # Both cleanups have to share this layer: deleting in a later RUN leaves the
+    # bytes in the earlier one and the image does not get any smaller.
+    rm -rf /usr/local/lib/node_modules/npm \
+           /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+           /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-v* \
+           /usr/local/bin/docker-entrypoint.sh \
+           /root/.npm
+
+COPY --from=mbgl /libmusl-bigstack.so /usr/lib/libmusl-bigstack.so
+
+ENV \
+    NODE_ENV="production" \
+    CHOKIDAR_USEPOLLING=1 \
+    CHOKIDAR_INTERVAL=500 \
+    # Mesa probes X11 then Wayland then surfaceless; pin it so it cannot pick
+    # up a display that is not there.
+    EGL_PLATFORM=surfaceless \
+    LIBGL_ALWAYS_SOFTWARE=1 \
+    GALLIUM_DRIVER=llvmpipe \
+    # jemalloc matters more here than on Ubuntu, not less: musl's mallocng is a
+    # known throughput bottleneck for multi-threaded allocation-heavy work,
+    # which is exactly what tile rendering is. libmusl-bigstack.so raises musl's
+    # 128 KiB default thread stack to 8 MiB for the MapLibre tile workers.
+    LD_PRELOAD="/usr/lib/libjemalloc.so.2:/usr/lib/libmusl-bigstack.so" \
+    MALLOC_CONF="background_thread:true,metadata_thp:auto,dirty_decay_ms:5000,muzzy_decay_ms:5000"
+
+COPY --from=builder /usr/src/app /usr/src/app
+COPY . /usr/src/app
+RUN chmod +x /usr/src/app/docker-entrypoint_alpine.sh && \
+    mkdir -p /data && chown node:node /data
+
+# Prove the shipped image can actually load its native modules, rather than
+# discovering a missing shared library on first render in production.
+RUN node -e "require('/usr/src/app/node_modules/@maplibre/maplibre-gl-native'); \
+             require('/usr/src/app/node_modules/canvas'); \
+             require('/usr/src/app/node_modules/sharp'); \
+             require('/usr/src/app/node_modules/sqlite3'); \
+             console.log('native modules load OK')" && \
+    node --input-type=module -e "import('/usr/src/app/src/mbtiles_wrapper.js').then(() => console.log('mbtiles backend loads OK'))"
+
+# Both preloads are load-bearing and both fail silently: without
+# libmusl-bigstack the MapLibre tile workers get musl's 128 KiB stacks and
+# segfault only under concurrency, and without jemalloc throughput drops on
+# musl's mallocng. grep runs with this stage's LD_PRELOAD applied, so its own
+# maps prove the loader honoured it. Fail the build rather than ship either.
+RUN grep -q libmusl-bigstack /proc/self/maps || { echo "LD_PRELOAD did not load libmusl-bigstack.so" >&2; exit 1; }; \
+    grep -q libjemalloc /proc/self/maps || { echo "LD_PRELOAD did not load libjemalloc.so.2" >&2; exit 1; }; \
+    echo "LD_PRELOAD verified: jemalloc + 8 MiB musl thread stacks active"
+
+VOLUME /data
+WORKDIR /data
+
+EXPOSE 8080
+
+USER node:node
+
+# The Ubuntu image runs node as PID 1, so it neither reaps children nor gets
+# signals through a shell. tini is signal-transparent, so http-shutdown's
+# graceful shutdown behaves as before.
+ENTRYPOINT ["/sbin/tini", "--", "/usr/src/app/docker-entrypoint_alpine.sh"]
+
+HEALTHCHECK CMD node /usr/src/app/src/healthcheck.js

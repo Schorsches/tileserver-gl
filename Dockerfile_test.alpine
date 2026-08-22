@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+#
+# Runs the mocha suite inside the image that actually ships.
+#
+# The Ubuntu Dockerfile_test builds a separate image with its own dependency
+# set, so it cannot catch "the runtime image is missing a shared library the
+# test image happened to have" -- exactly the class of bug a base-image change
+# introduces. This one starts FROM the candidate instead.
+#
+#   docker build -f Dockerfile.alpine -t tileserver-gl:alpine .
+#   docker build -f Dockerfile_test.alpine --build-arg BASE=tileserver-gl:alpine .
+
+ARG BASE=tileserver-gl:alpine
+FROM ${BASE}
+
+USER root
+WORKDIR /usr/src/app
+
+# The runtime image deliberately ships without npm (its vendored dependency tree
+# is a large, unpatchable source of scanner findings). Bring it back for the
+# test run only.
+COPY --from=node:24-alpine3.22 /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    apk add --no-cache curl unzip
+
+# test/setup.js chdirs into test_data and boots the server on port 8888.
+RUN curl -fsSL -o /tmp/test_data.zip \
+      https://github.com/maptiler/tileserver-gl/releases/download/v1.3.0/test_data.zip && \
+    unzip -q /tmp/test_data.zip -d test_data && \
+    rm /tmp/test_data.zip
+
+# devDependencies only; the production tree and the native addons are already
+# in place from the runtime image and must not be rebuilt.
+RUN npm install --ignore-scripts --no-save \
+      mocha chai should supertest pixelmatch cross-env
+
+# The visual-regression fixtures in test/fixtures/visual/ are the arbiter of
+# EGL-vs-GLX rendering parity. GENERATE_FIXTURES is deliberately not set --
+# regenerating them here would launder the very regression this is testing for.
+RUN node -e "require('@maplibre/maplibre-gl-native'); require('canvas'); require('sharp')" && \
+    npx mocha test/**.js --timeout 10000 --exit

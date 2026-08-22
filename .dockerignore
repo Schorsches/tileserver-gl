@@ -5,4 +5,6 @@
 !package.json
 !package-lock.json
 !docker-entrypoint.sh
+!docker-entrypoint_alpine.sh
+!docker
 **.gitignore

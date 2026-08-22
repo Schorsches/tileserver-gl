@@ -40,7 +40,7 @@ RUN mkdir -p /etc/apt/keyrings; \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list; \
     apt-get -qq update; \
     apt-get install -y nodejs; \
-    npm i -g npm@latest; \
+    # See Dockerfile: npm 12 blocks install scripts, breaking the native builds.
     apt-get -y remove gnupg; \
     apt-get -y --purge autoremove; \
     apt-get clean; \
@@ -55,7 +55,8 @@ RUN curl -L -o test_data.zip https://github.com/maptiler/tileserver-gl/releases/
 
 COPY package.json .
 # Running npm install for development (includes devDependencies for tests)
-RUN npm install && npm rebuild canvas --build-from-source
+# npm 12 removed the --build-from-source CLI flag; the env-var form is portable.
+RUN npm install && npm_config_build_from_source=true npm rebuild canvas
 COPY / .
 
 # Execute tests using xvfb-run
