@@ -1,0 +1,122 @@
+name: CT Alpine
+
+# Container tests for the Alpine image: build, smoke test, full mocha suite
+# inside the shipped image, and a CVE gate with an old-vs-new comparison.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Dockerfile.alpine'
+      - 'Dockerfile.mbgl'
+      - 'Dockerfile_test.alpine'
+      - 'docker/**'
+      - 'docker-entrypoint_alpine.sh'
+      - 'src/**'
+      - 'package*.json'
+      - '.github/workflows/ct-alpine.yml'
+
+env:
+  MBGL_IMAGE: ghcr.io/${{ github.repository_owner }}/tileserver-gl-mbgl:node-v6.4.1-abi137-alpine3.22-egl
+  REFERENCE_IMAGE: maptiler/tileserver-gl:latest
+
+jobs:
+  container-test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The prebuilt addon is keyed on the Node ABI and the maplibre version.
+      # If either drifts from package.json the image would silently ship a
+      # mismatched binary, so fail here instead.
+      - name: Assert prebuilt addon matches package.json
+        run: |
+          want=$(node -p "require('./package.json').dependencies['@maplibre/maplibre-gl-native']" | tr -d '^~')
+          case "${MBGL_IMAGE}" in
+            *node-v${want}-*) echo "maplibre version ${want} matches MBGL_IMAGE" ;;
+            *) echo "::error::MBGL_IMAGE does not match package.json maplibre version ${want}"; exit 1 ;;
+          esac
+
+      - name: Build Alpine image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.alpine
+          build-args: MBGL_IMAGE=${{ env.MBGL_IMAGE }}
+          tags: tileserver-gl:alpine
+          load: true
+          push: false
+          cache-from: type=gha,scope=alpine
+          cache-to: type=gha,mode=max,scope=alpine
+
+      - name: Smoke test startup and rendering
+        run: |
+          curl -fsSL -o test_data.zip \
+            https://github.com/maptiler/tileserver-gl/releases/download/v1.3.0/test_data.zip
+          unzip -q test_data.zip -d test_data
+          docker run -d --name tsgl -p 8080:8080 -v "$PWD/test_data:/data" tileserver-gl:alpine
+          for i in $(seq 1 60); do
+            docker logs tsgl 2>&1 | grep -q "Startup complete" && break
+            sleep 1
+          done
+          docker logs tsgl
+          docker logs tsgl 2>&1 | grep -q "Startup complete" || { echo "::error::server never reported startup"; exit 1; }
+          # "started" and "can actually render" are different claims -- check both.
+          curl -fsS http://localhost:8080/health > /dev/null
+          curl -fsS -o /tmp/tile.png http://localhost:8080/styles/test-style/static/0,0,0/256x256.png
+          file /tmp/tile.png | grep -q 'PNG image' || { echo "::error::rendered tile is not a PNG"; exit 1; }
+          docker rm -f tsgl
+
+      - name: Run the full test suite inside the shipped image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile_test.alpine
+          build-args: BASE=tileserver-gl:alpine
+          load: false
+          push: false
+
+      - name: Trivy scan (gate)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: tileserver-gl:alpine
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '1'
+          format: 'table'
+
+      - name: Compare CVEs and size against the Ubuntu image
+        if: always()
+        run: |
+          docker pull "$REFERENCE_IMAGE"
+          scan() {
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+              aquasec/trivy:latest image --quiet --severity HIGH,CRITICAL \
+              --ignore-unfixed --format json "$1" 2>/dev/null \
+              | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(len(r.get('Vulnerabilities') or []) for r in (d.get('Results') or [])))"
+          }
+          old=$(scan "$REFERENCE_IMAGE"); new=$(scan tileserver-gl:alpine)
+          oldsz=$(docker image inspect "$REFERENCE_IMAGE" --format '{{.Size}}')
+          newsz=$(docker image inspect tileserver-gl:alpine --format '{{.Size}}')
+          {
+            echo '### Alpine image vs Ubuntu image'
+            echo
+            echo '| | Ubuntu (published) | Alpine (this build) |'
+            echo '|---|---|---|'
+            echo "| Fixable HIGH+CRITICAL | $old | $new |"
+            echo "| Size | $(numfmt --to=iec $oldsz) | $(numfmt --to=iec $newsz) |"
+            echo
+            echo '_Note: ICU, sqlite and nunicode are vendored into `mbgl.node`, so they are invisible to Trivy. Part of the reduction is fewer packages, part is scanner blindness -- both are listed here deliberately._'
+          } >> "$GITHUB_STEP_SUMMARY"

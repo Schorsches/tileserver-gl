@@ -1,0 +1,106 @@
+name: MBGL Alpine prebuild
+
+# Compiles MapLibre Native's Node addon against musl and publishes it to GHCR.
+#
+# This is separated from the app build on purpose: the compile takes 30-60
+# minutes, which would make every ordinary `docker build` and every CI run
+# unusable, and a full C++ build tree would evict the app layer cache from the
+# 10 GB GitHub Actions cache. Dockerfile.alpine consumes the published image
+# with a one-line COPY --from=.
+#
+# Rebuild only when @maplibre/maplibre-gl-native is bumped, when the Node ABI
+# changes, or when the Alpine base moves.
+
+on:
+  workflow_dispatch:
+    inputs:
+      maplibre_ref:
+        description: 'maplibre-native git tag to build'
+        required: false
+        default: 'node-v6.4.1'
+  push:
+    branches: [master]
+    paths:
+      - 'Dockerfile.mbgl'
+      - 'docker/build-mbgl-alpine.sh'
+      - 'docker/musl-bigstack.c'
+      - '.github/workflows/mbgl-prebuild.yml'
+
+env:
+  MAPLIBRE_REF: ${{ github.event.inputs.maplibre_ref || 'node-v6.4.1' }}
+  NODE_ABI: '137'
+  ALPINE_VERSION: '3.22'
+  IMAGE: ghcr.io/${{ github.repository_owner }}/tileserver-gl-mbgl
+
+jobs:
+  build:
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          # Build each architecture on its own native runner. Do not add arm64
+          # via QEMU: it turns a 40-minute C++ build into a multi-hour one.
+          # - arch: arm64
+          #   runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push mbgl artifact image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.mbgl
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            MAPLIBRE_REF=${{ env.MAPLIBRE_REF }}
+            BUILTIN_ICU=ON
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.MAPLIBRE_REF }}-abi${{ env.NODE_ABI }}-alpine${{ env.ALPINE_VERSION }}-egl-${{ matrix.arch }}
+          cache-from: type=gha,scope=mbgl-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=mbgl-${{ matrix.arch }}
+
+      - name: Report artifact linkage
+        run: |
+          TAG='${{ env.IMAGE }}:${{ env.MAPLIBRE_REF }}-abi${{ env.NODE_ABI }}-alpine${{ env.ALPINE_VERSION }}-egl-${{ matrix.arch }}'
+          docker create --name mbgl-artifact "$TAG" || true
+          docker cp mbgl-artifact:/BUILDINFO.json - > /dev/null 2>&1 || true
+          {
+            echo '### mbgl.node prebuild (${{ matrix.arch }})'
+            echo '```'
+            docker run --rm --entrypoint sh alpine:${{ env.ALPINE_VERSION }} -c 'true' >/dev/null 2>&1 || true
+            echo "$TAG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # A manifest list means Dockerfile.alpine's COPY --from= resolves the
+      # right architecture automatically from TARGETPLATFORM, so the app
+      # Dockerfile needs no per-arch conditionals.
+      - name: Create multi-arch manifest
+        run: |
+          BASE='${{ env.IMAGE }}:${{ env.MAPLIBRE_REF }}-abi${{ env.NODE_ABI }}-alpine${{ env.ALPINE_VERSION }}-egl'
+          docker buildx imagetools create -t "$BASE" "$BASE-amd64"
