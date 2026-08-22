@@ -3,19 +3,12 @@ name: CT Alpine
 # Container tests for the Alpine image: build, smoke test, full mocha suite
 # inside the shipped image, and a CVE gate with an old-vs-new comparison.
 
+# Invoked from pipeline.yml alongside ci.yml and ct.yml. It deliberately has no
+# pull_request trigger of its own: that would run it a second time, outside
+# pipeline.yml's concurrency group and missing from its status badge.
 on:
   workflow_call:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - 'Dockerfile.alpine'
-      - 'Dockerfile.mbgl'
-      - 'Dockerfile_test.alpine'
-      - 'docker/**'
-      - 'docker-entrypoint_alpine.sh'
-      - 'src/**'
-      - 'package*.json'
-      - '.github/workflows/ct-alpine.yml'
 
 env:
   MBGL_IMAGE: ghcr.io/${{ github.repository_owner }}/tileserver-gl-mbgl:node-v6.4.1-abi137-alpine3.22-egl
@@ -89,7 +82,7 @@ jobs:
           push: false
 
       - name: Trivy scan (gate)
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: tileserver-gl:alpine
           severity: 'CRITICAL,HIGH'

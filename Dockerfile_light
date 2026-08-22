@@ -24,7 +24,12 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends --no-install-suggests nodejs && \
-    npm i -g npm@latest && \
+    # Deliberately NOT `npm i -g npm@latest`: npm 12 blocks package install
+    # scripts by default (allowScripts). publish.js strips canvas, sharp and
+    # maplibre from the light package, but sqlite3 still comes in via
+    # @mapbox/mbtiles, and skipping its build yields an image that builds fine
+    # and then crashes on startup with "Could not locate the bindings file".
+    # Use the npm bundled with the pinned Node instead.
     apt-get -y remove curl gnupg && \
     apt-get -y --purge autoremove && \
     apt-get clean && \
@@ -41,7 +46,10 @@ RUN npm config set fetch-retries 5 && \
     npm config set fetch-retry-maxtimeout 600000 && \
     npm ci --omit=dev && \
     # Build canvas from source for the Noble architecture
-    npm rebuild canvas --build-from-source && \
+    # `--build-from-source` was never a real npm flag -- npm just forwarded it as
+    # npm_config_build_from_source and npm 12 made unknown flags fatal. Set the
+    # env var directly: same mechanism, portable across npm versions.
+    npm_config_build_from_source=true npm rebuild canvas && \
     chown -R root:root /usr/src/app
 
 # --- Final Stage ---
@@ -67,7 +75,6 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_24.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends --no-install-suggests nodejs && \
-    npm i -g npm@latest && \
     apt-get -y remove curl gnupg && \
     apt-get -y --purge autoremove && \
     apt-get clean && \
@@ -78,6 +85,10 @@ RUN mkdir -p /home/node/.aws && \
 
 COPY --from=builder /usr/src/app /usr/src/app
 COPY . /usr/src/app
+
+# sqlite3 is the only native module left after publish.js strips the rest.
+# Fail the build rather than the container if its binding is missing.
+RUN node -e "require('/usr/src/app/node_modules/sqlite3'); console.log('native modules load OK')"
 
 RUN mkdir -p /data && \
     chown node:node /data && \
