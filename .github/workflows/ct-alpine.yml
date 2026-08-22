@@ -11,7 +11,9 @@ on:
   workflow_dispatch:
 
 env:
-  MBGL_IMAGE: ghcr.io/${{ github.repository_owner }}/tileserver-gl-mbgl:node-v6.4.1-abi137-alpine3.22-egl
+  MAPLIBRE_REF: node-v6.4.1
+  NODE_ABI: '137'
+  ALPINE_VERSION: '3.22'
   REFERENCE_IMAGE: maptiler/tileserver-gl:latest
 
 jobs:
@@ -31,16 +33,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # github.repository_owner keeps the account's original casing, but a
+      # registry reference must be lowercase or buildx rejects it outright:
+      # `invalid reference format: repository name must be lowercase`.
+      - name: Resolve MBGL_IMAGE
+        run: |
+          echo "MBGL_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tileserver-gl-mbgl:${MAPLIBRE_REF}-abi${NODE_ABI}-alpine${ALPINE_VERSION}-egl" >> "$GITHUB_ENV"
+
       # The prebuilt addon is keyed on the Node ABI and the maplibre version.
       # If either drifts from package.json the image would silently ship a
       # mismatched binary, so fail here instead.
       - name: Assert prebuilt addon matches package.json
         run: |
+          echo "MBGL_IMAGE=${MBGL_IMAGE}"
           want=$(node -p "require('./package.json').dependencies['@maplibre/maplibre-gl-native']" | tr -d '^~')
-          case "${MBGL_IMAGE}" in
-            *node-v${want}-*) echo "maplibre version ${want} matches MBGL_IMAGE" ;;
-            *) echo "::error::MBGL_IMAGE does not match package.json maplibre version ${want}"; exit 1 ;;
-          esac
+          [ "${MAPLIBRE_REF}" = "node-v${want}" ] || {
+            echo "::error::MAPLIBRE_REF ${MAPLIBRE_REF} does not match package.json maplibre version ${want}"
+            exit 1
+          }
+          echo "maplibre version ${want} matches MAPLIBRE_REF"
 
       - name: Build Alpine image
         uses: docker/build-push-action@v7
