@@ -53,6 +53,18 @@ jobs:
           }
           echo "maplibre version ${want} matches MAPLIBRE_REF"
 
+      # Without this the failure surfaces as a bare buildx
+      # `<ref>: not found` against a Dockerfile line, which gives no hint that
+      # the fix is a one-off run of another workflow.
+      - name: Check the prebuilt addon exists
+        run: |
+          if docker buildx imagetools inspect "${MBGL_IMAGE}" >/dev/null 2>&1; then
+            echo "found ${MBGL_IMAGE}"
+          else
+            echo "::error title=Missing mbgl prebuild::${MBGL_IMAGE} does not exist. Run the 'MBGL Alpine prebuild' workflow once (Actions -> MBGL Alpine prebuild -> Run workflow) to publish it, then re-run this job."
+            exit 1
+          fi
+
       - name: Build Alpine image
         uses: docker/build-push-action@v7
         with:
